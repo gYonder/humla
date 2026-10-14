@@ -2,9 +2,10 @@
 //!
 //! A Note whose Title Humla owns — empty, a `Recording 19 Aug 14:32`
 //! timestamp, or the `Imported audio` import fallback — gets a short phrase
-//! derived from the head of its own content once that content settles. The
-//! model call is deliberately small and cheap: the first paragraphs of the
-//! notes and the transcript, four to six words back, no streaming.
+//! derived from its own content once that content settles. The
+//! model call is deliberately small and cheap: the head of the
+//! notes and a head/middle/tail sample of the transcript, four to six words back,
+//! no streaming.
 //!
 //! Three things this is *not*, all of them settled during the issue's
 //! grilling:
@@ -13,9 +14,9 @@
 //!   presses, so a summary-completion trigger would leave the motivating case
 //!   — a menu-bar recorder who never opens the note — on its timestamp
 //!   forever.
-//! - **Not live.** The input is the same opening paragraphs whether we ask
-//!   during the recording or after it, so firing early buys nothing and
-//!   spends GPU exactly when local Whisper needs it.
+//! - **Not live.** The title needs the closing exchanges, so firing during
+//!   the recording would title from an incomplete tail as well as contend
+//!   with local Whisper for GPU — after stop is the cheap moment.
 //! - **Not loud.** Failure is silent. A user who never asked for a Title must
 //!   not be told one failed, and a local-only user with no LLM configured
 //!   would otherwise be toasted after every recording.
@@ -38,10 +39,27 @@ const TITLE_MAX_CHARS: usize = 60;
 /// Title than the timestamp it would replace, so we reject instead.
 const TITLE_JUNK_CHARS: usize = 2 * TITLE_MAX_CHARS;
 
-/// How much of each content block the model sees. A title comes from the head
-/// of a note — the agenda, the first exchange — and sending the whole
-/// transcript would cost real tokens for no better answer.
+/// How much of each content block the model sees. Notes contribute their head
+/// — the agenda the user typed. The transcript contributes a head+tail sample
+/// within the same budget (see below): sending the whole transcript would
+/// cost real tokens, but head-only always saw the smalltalk warm-up.
 const BLOCK_CHAR_BUDGET: usize = 750;
+
+/// Transcript opener kept verbatim. Enough to catch an agenda stated up front,
+/// small enough that weather-and-weekend smalltalk can't fill the budget.
+/// Borrowed from meetily's "analyze the entire transcript" insight: the title
+/// must see past the opening exchange, so most of the budget goes to the
+/// middle and tail where the substance lands.
+const TRANSCRIPT_HEAD_CHARS: usize = 150;
+
+/// Centered transcript window. Covers the discussion neither end sees — the
+/// important-decision-in-the-middle case a head+tail sample misses entirely.
+const TRANSCRIPT_MID_CHARS: usize = 300;
+
+/// Transcript tail kept verbatim. Together with the head, the middle and the
+/// two `…` joiners this stays under `BLOCK_CHAR_BUDGET`, so the fix costs no
+/// extra tokens.
+const TRANSCRIPT_TAIL_CHARS: usize = 250;
 
 /// Turn raw model output into a Title, or `None` when there is nothing usable
 /// in it.
@@ -127,19 +145,46 @@ fn truncate_chars(t: &str, max: usize) -> String {
     }
 }
 
-/// The two labelled blocks the model reads, capped at the head of each.
+/// The two labelled blocks the model reads: head of the notes, head/middle/tail
+/// of the transcript.
 ///
 /// Reuses the summary path's `[Notater]` / `[Transkripsjon]` convention
 /// including its `(ingen)` placeholder: both blocks are always sent, so a
 /// typed-only, a recorded-only and a mixed Note all take one path with no
 /// precedence rule — and a thinking model isn't left wondering whether a
 /// missing block is absent or hidden.
+///
+/// The transcript is the fix for smalltalk-dominated titles: `head_chars`
+/// alone always saw `[0, 750)` — precisely the weather/how-are-you warm-up.
+/// Sampling head + middle + tail within the same budget lets the model see the
+/// substance no single end holds, mirroring what meetily gets for free by
+/// titling from its summary rather than the raw stream.
 pub(crate) fn title_input(body_text: &str, transcript: &str) -> String {
     let notes = head_chars(body_text, BLOCK_CHAR_BUDGET);
-    let spoken = head_chars(transcript, BLOCK_CHAR_BUDGET);
+    let spoken = sample_transcript(transcript);
     let notes_block = if notes.is_empty() { "(ingen)".to_string() } else { notes };
     let transcript_block = if spoken.is_empty() { "(ingen)".to_string() } else { spoken };
     format!("[Notater]\n{notes_block}\n\n[Transkripsjon]\n{transcript_block}")
+}
+
+/// Head + middle + tail sample of the transcript within `BLOCK_CHAR_BUDGET`.
+///
+/// Short transcripts pass through untouched. Long ones keep the first
+/// `TRANSCRIPT_HEAD_CHARS` (agenda cue), a centered `TRANSCRIPT_MID_CHARS`
+/// window (the discussion neither end sees) and the last
+/// `TRANSCRIPT_TAIL_CHARS` (decisions and wrap-up), joined with ellipses so
+/// the model knows speech was cut. All cuts land on word and char boundaries.
+/// Near the budget boundary the windows can overlap by a few words — harmless
+/// duplication in a title prompt.
+fn sample_transcript(text: &str) -> String {
+    let t = text.trim();
+    if t.chars().count() <= BLOCK_CHAR_BUDGET {
+        return t.to_string();
+    }
+    let head = cut_head_word_boundary(t, TRANSCRIPT_HEAD_CHARS);
+    let middle = cut_middle_word_boundary(t, TRANSCRIPT_MID_CHARS);
+    let tail = cut_tail_word_boundary(t, TRANSCRIPT_TAIL_CHARS);
+    format!("{head}\n…\n{middle}\n…\n{tail}")
 }
 
 /// First `budget` chars of `text`, trimmed, cut on a `char` boundary.
@@ -149,13 +194,85 @@ fn head_chars(text: &str, budget: usize) -> String {
     t[..cut].trim_end().to_string()
 }
 
+/// Head cut that steps back to the previous whitespace, so the fragment never
+/// ends mid-word and pulls the model toward a dangling fragment.
+fn cut_head_word_boundary(text: &str, budget: usize) -> String {
+    let raw = head_chars(text, budget);
+    match raw.rfind(char::is_whitespace) {
+        Some(i) if i >= budget / 2 => raw[..i].trim_end().to_string(),
+        _ => raw,
+    }
+}
+
+/// Byte index of the first whole word at or after `start_byte` (`start_byte`
+/// must be a char boundary): unchanged when already on a boundary — start of
+/// text, or preceded by whitespace — otherwise stepped forward to the next
+/// whitespace, unless that step would eat most of `budget` (one very long
+/// word). Whitespace-aware (`is_whitespace`, not just `' '`) so newlines and
+/// tabs count as boundaries too.
+fn word_start_at_or_after(t: &str, start_byte: usize, budget: usize) -> usize {
+    if start_byte == 0
+        || t[..start_byte]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+    {
+        return start_byte;
+    }
+    match t[start_byte..]
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+    {
+        Some((i, c)) if i < budget / 2 => start_byte + i + c.len_utf8(),
+        _ => start_byte,
+    }
+}
+
+/// Centered `budget`-char window of `text`, on word boundaries where cheap.
+/// Shares the tail's boundary rule: a window already starting on a boundary
+/// keeps its first word whole.
+fn cut_middle_word_boundary(text: &str, budget: usize) -> String {
+    let t = text.trim();
+    let total = t.chars().count();
+    if total <= budget {
+        return t.to_string();
+    }
+    let skip = (total - budget) / 2;
+    let start_byte = t.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0);
+    let from = word_start_at_or_after(t, start_byte, budget);
+    cut_head_word_boundary(&t[from..], budget)
+}
+
+/// Last `budget` chars of `text`, starting on the next word boundary so the
+/// fragment never starts mid-word — unless it already does, in which case the
+/// first word is kept whole. Char-boundary safe for multibyte text.
+fn cut_tail_word_boundary(text: &str, budget: usize) -> String {
+    let t = text.trim();
+    let total = t.chars().count();
+    if total <= budget {
+        return t.to_string();
+    }
+    let skip = total - budget;
+    let start_byte = t.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0);
+    let from = word_start_at_or_after(t, start_byte, budget);
+    t[from..].trim_start().to_string()
+}
+
 /// The system prompt. Minimal on purpose — a constraint-heavy prompt becomes a
-/// checklist a small thinking model re-litigates instead of following.
+/// checklist a small thinking model re-litigates instead of following. The two
+/// added sentences are meetily's whole trick spelled out for a three-part
+/// sample: ignore the pleasantries around the cuts, read the parts as one
+/// excerpt — and when smalltalk is all there is, name that instead of
+/// inventing a topic.
 fn title_prompt(language: &str) -> String {
     format!(
         "Give the note below a short title naming what it is about. \
          Four to six words. Answer with the title alone — no quotes, no label, \
-         no final period, no explanation.\n\n{}",
+         no final period, no explanation. Name the main topic, decision or \
+         purpose — not the greetings, weather or check-ins at the start, nor \
+         the sign-offs at the end; each … marks cut-out speech, so read the \
+         parts as one excerpt. If smalltalk is all the note holds, name that \
+         rather than inventing a topic.\n\n{}",
         language_directive(language)
     )
 }
@@ -435,5 +552,150 @@ mod tests {
         assert!(title_prompt("en").contains("English"));
         // On `auto` the only cue is the transcript block — same rule as #167.
         assert!(title_prompt("auto").contains("transcript"));
+    }
+
+    #[test]
+    fn sampling_budget_never_exceeds_block_budget() {
+        // Locks the "costs no extra tokens" claim: head + joiner + middle +
+        // joiner + tail must fit inside one block, so a constants bump can't
+        // silently rot it.
+        assert!(
+            TRANSCRIPT_HEAD_CHARS + 3 + TRANSCRIPT_MID_CHARS + 3 + TRANSCRIPT_TAIL_CHARS
+                <= BLOCK_CHAR_BUDGET
+        );
+    }
+
+    #[test]
+    fn the_prompt_ignores_pleasantries_at_both_ends() {
+        // Meetily's trick spelled out for a three-part sample: the faithful
+        // answer to "what is this about" must not be the weather opener or
+        // the goodbye — unless smalltalk is all there is.
+        let p = title_prompt("en");
+        assert!(p.contains("nor the sign-offs at the end"), "{p}");
+        assert!(p.contains("read the parts as one excerpt"), "{p}");
+        assert!(p.contains("If smalltalk is all the note holds"), "{p}");
+    }
+
+    #[test]
+    fn short_transcript_passes_through_untouched() {
+        let short = "You: hei Hege. Hege: hei, hvordan går det?";
+        assert_eq!(sample_transcript(short), short);
+        assert_eq!(sample_transcript(""), "");
+    }
+
+    #[test]
+    fn long_transcript_keeps_head_and_tail_within_budget() {
+        // Opener smalltalk + substance at the end: the exact failure mode from
+        // the issue (title about weather/feelings instead of the meeting).
+        let opener =
+            "You: hei, fint vær i dag? Hege: ja, nydelig sol! Hvordan har du det? ".repeat(20);
+        let substance =
+            "Beslutning: lanseringsplanen utsettes til fredag, Hege eier blokkerne. ".repeat(20);
+        let transcript = format!("{opener} {substance}");
+        assert!(transcript.chars().count() > BLOCK_CHAR_BUDGET);
+        let sampled = sample_transcript(&transcript);
+        // Head cue preserved, tail substance visible, middle cut marked.
+        assert!(sampled.contains("fint vær"), "{sampled}");
+        assert!(sampled.contains("lanseringsplanen"), "{sampled}");
+        assert!(sampled.contains("…"), "{sampled}");
+        assert!(
+            sampled.chars().count() <= BLOCK_CHAR_BUDGET,
+            "budget blown: {}",
+            sampled.chars().count()
+        );
+    }
+
+    #[test]
+    fn transcript_just_over_budget_keeps_both_ends() {
+        // Near-boundary: head and tail come closest here, so this is where an
+        // overlap/duplication bug would show.
+        let transcript = format!(
+            "{} {}",
+            "værprat og helgeplaner. ".repeat(25),
+            "lanseringsplanen utsettes til fredag. ".repeat(8)
+        );
+        assert!(transcript.chars().count() > BLOCK_CHAR_BUDGET);
+        let sampled = sample_transcript(&transcript);
+        assert!(sampled.contains("værprat"), "{sampled}");
+        assert!(sampled.contains("lanseringsplanen"), "{sampled}");
+        assert!(
+            sampled.chars().count() <= BLOCK_CHAR_BUDGET,
+            "{}",
+            sampled.chars().count()
+        );
+    }
+
+    #[test]
+    fn transcript_sample_never_starts_or_ends_mid_word() {
+        let transcript = ("supercalifragilisticexpialidocious ".repeat(30))
+            + &"lanseringsplanen eies av Hege ".repeat(30);
+        let sampled = sample_transcript(&transcript);
+        // The joiner splits head from tail; neither side dangles half a word.
+        for part in sampled.split("\n…\n") {
+            assert!(!part.starts_with("uper"), "{part}");
+            assert!(!part.ends_with("supercalifragilisti"), "{part}");
+        }
+    }
+
+    #[test]
+    fn transcript_tail_is_multibyte_safe() {
+        let wide = "æ ".repeat(2000);
+        let sampled = sample_transcript(&wide);
+        // Would have panicked on a byte-index slice; reaching here is the test.
+        assert!(sampled.contains('æ'));
+        assert!(sampled.chars().count() <= BLOCK_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn tail_keeps_a_word_it_starts_on() {
+        // Regression: the tail must not delete a complete word when the cut
+        // already lands on a word boundary. Alignment locked: skip lands
+        // exactly on the 'O' of ORION, preceded by a space.
+        let text = format!(
+            "{}ORION vedtaket {}",
+            "p ".repeat(100),
+            "q ".repeat(117) + "q"
+        );
+        assert_eq!(text.chars().count(), 450);
+        let tail = cut_tail_word_boundary(&text, 250);
+        assert!(tail.contains("ORION"), "{tail}");
+    }
+
+    #[test]
+    fn tail_boundary_counts_newlines_and_tabs() {
+        // Same boundary rule, but the preceding whitespace is a newline rather
+        // than a space — `is_whitespace`, not just `' '`.
+        let text = format!("{}a\nORION x {}", "a ".repeat(99), "b ".repeat(121));
+        assert_eq!(text.chars().count(), 450);
+        let tail = cut_tail_word_boundary(&text, 250);
+        assert!(tail.contains("ORION"), "{tail}");
+    }
+
+    #[test]
+    fn head_cut_steps_back_over_newlines() {
+        // The last whitespace before the cut is a newline: stepping back to
+        // an earlier space would throw away a whole valid word.
+        assert_eq!(cut_head_word_boundary("aaa bbb\nccc ddd", 11), "aaa bbb");
+    }
+
+    #[test]
+    fn long_meeting_keeps_opener_middle_and_closer() {
+        // The important-decision-in-the-middle case: head+tail alone would
+        // show smalltalk and farewells and miss the decision entirely.
+        let opener = "fint vær i dag, hvordan står det til? ".repeat(40);
+        let middle = "ORION-vedtaket: utsettelse til fredag, Hege eier blokkerne. ".repeat(15);
+        let closer = "takk for i dag, ha det bra, god helg! ".repeat(40);
+        let transcript = format!("{opener}{middle}{closer}");
+        assert!(transcript.chars().count() > BLOCK_CHAR_BUDGET);
+        let sampled = sample_transcript(&transcript);
+        assert!(sampled.contains("fint vær"), "{sampled}");
+        assert!(sampled.contains("ORION-vedtaket"), "{sampled}");
+        assert!(sampled.contains("god helg"), "{sampled}");
+        assert_eq!(sampled.matches('…').count(), 2, "{sampled}");
+        assert!(
+            sampled.chars().count() <= BLOCK_CHAR_BUDGET,
+            "{}",
+            sampled.chars().count()
+        );
     }
 }
